@@ -611,7 +611,8 @@ const errorManager = (() => {
     if(/API key not valid|keyInvalid|API_KEY_INVALID/i.test(s)) return 'YouTube API key is invalid. Create/copy the correct key from this same Google Cloud project.';
     if(/refererNotAllowed|ipRefererBlocked|API_KEY_HTTP_REFERRER_BLOCKED/i.test(s)) return 'API key HTTP-referrer restriction blocked this website. Add your exact GitHub Pages origin.';
     if(/accessNotConfigured|SERVICE_DISABLED/i.test(s)) return 'YouTube Data API v3 is not enabled for the Google Cloud project used by this API key.';
-    if(/404/.test(s)) return 'Google returned 404. The requested YouTube resource was not found. See Diagnostics for the exact endpoint/error.';
+    if(/404/.test(s)) return s;
+    if(/Sync video request failed/i.test(s)) return s;
     if(/network|failed to fetch/i.test(s)) return 'Network error. Check your connection, browser extensions, or CORS/network blocking.';
     if(/JSON/i.test(s)) return 'Received an unexpected response format.';
     return s;
@@ -828,19 +829,28 @@ const youtubeDataService = (() => {
     }
   }
 
-  async function searchChannelVideos(channelId, maxTotal=200){
+  async function searchChannelVideos(channelId, maxTotal=200, useAuth=true){
+    // For the signed-in user's own channel, use the OAuth token instead of
+    // the browser API key. This avoids API-key referrer/restriction issues
+    // during Sync and keeps private-channel operations authenticated.
     let items = [];
     let pageToken = '';
     while(items.length < maxTotal){
       const data = await apiFetch('/search', {
         part:'snippet', channelId, type:'video', order:'date', maxResults:50,
         pageToken: pageToken||undefined
-      }, false);
+      }, useAuth);
       items = items.concat(data.items||[]);
       pageToken = data.nextPageToken;
       if(!pageToken) break;
     }
     return items.slice(0, maxTotal);
+  }
+
+  async function getMyVideos(maxTotal=200){
+    const ch = await getMyChannel();
+    if(!ch || !ch.id) throw new Error('YouTube returned a channel without a valid channel ID.');
+    return searchChannelVideos(ch.id, maxTotal, true);
   }
 
   async function getVideoDetails(videoIds, useAuth=true){
@@ -854,7 +864,7 @@ const youtubeDataService = (() => {
     return out;
   }
 
-  return { getMyChannel, getChannelById, getUploads, searchChannelVideos, getVideoDetails };
+  return { getMyChannel, getChannelById, getUploads, searchChannelVideos, getMyVideos, getVideoDetails };
 })();
 
 /* ==========================================================================
@@ -1632,7 +1642,7 @@ async function fullSync({interactive=true}={}){
   const steps = ['Connecting...','Fetching channel...','Fetching videos...','Fetching analytics...','Analyzing content...','Complete.'];
   updateSyncProgress(0, steps);
   try{
-    if(!configManager.hasCreds()) throw new Error('Please add your API keys in Settings first.');
+    if(!configManager.get().GOOGLE_CLIENT_ID) throw new Error('Please add your Google OAuth Client ID in Settings first.');
     if(!oauthService.isConnected()) await oauthService.requestToken(interactive);
     updateSyncProgress(1, steps);
 
@@ -1642,22 +1652,17 @@ async function fullSync({interactive=true}={}){
     await storageService.put('channel', channel);
     updateSyncProgress(2, steps);
 
-    const uploadsPlaylist = channel.contentDetails && channel.contentDetails.relatedPlaylists && channel.contentDetails.relatedPlaylists.uploads;
+    // IMPORTANT: Do not use the uploads playlist for Sync. Some accounts can
+    // return a valid channel object but a 404 for that playlist resource.
+    // Search the signed-in channel directly with OAuth instead. This also
+    // prevents the browser API-key restriction from affecting Sync.
     let rawVideos = [];
-    if(uploadsPlaylist){
-      try{
-        const items = await youtubeDataService.getUploads(uploadsPlaylist, 200, true);
-        const ids = items.map(i=>i.contentDetails && i.contentDetails.videoId).filter(Boolean);
-        rawVideos = await youtubeDataService.getVideoDetails(ids, true);
-      }catch(uploadErr){
-        // Some channels/accounts can expose the channel but reject the uploads
-        // playlist resource. Fall back to public search by the authenticated
-        // channel ID so Sync can still complete.
-        console.warn('[Sync] uploads playlist failed; using search fallback', uploadErr);
-        const items = await youtubeDataService.searchChannelVideos(channel.id, 200);
-        const ids = items.map(i=>i.id && i.id.videoId).filter(Boolean);
-        rawVideos = await youtubeDataService.getVideoDetails(ids, false);
-      }
+    try{
+      const items = await youtubeDataService.searchChannelVideos(channel.id, 200, true);
+      const ids = items.map(i=>i.id && i.id.videoId).filter(Boolean);
+      rawVideos = ids.length ? await youtubeDataService.getVideoDetails(ids, true) : [];
+    }catch(videoErr){
+      throw new Error('Sync video request failed: '+(videoErr && videoErr.message ? videoErr.message : videoErr));
     }
     state.rawVideos = rawVideos;
     state.videos = rawVideos.map(analyticsEngine.normalizeVideo);
@@ -1876,15 +1881,14 @@ function wireSettings(){
     return 'OAuth + YouTube channel access works. Channel: '+title;
   });
   document.getElementById('testSyncPipeline').onclick = ()=>runDiag('Sync Pipeline', async ()=>{
-    if(!configManager.hasCreds()) throw new Error('Missing YouTube API key or Google OAuth Client ID.');
+    const cfg = configManager.get();
+    if(!cfg.GOOGLE_CLIENT_ID) throw new Error('Missing Google OAuth Client ID.');
     await oauthService.requestToken(true);
     const ch = await youtubeDataService.getMyChannel();
-    const uploads = ch && ch.contentDetails && ch.contentDetails.relatedPlaylists && ch.contentDetails.relatedPlaylists.uploads;
-    if(!uploads) throw new Error('Channel found but its uploads playlist ID is missing.');
-    const items = await youtubeDataService.getUploads(uploads, 3, true);
-    const ids = items.map(i=>i.contentDetails && i.contentDetails.videoId).filter(Boolean);
+    const items = await youtubeDataService.searchChannelVideos(ch.id, 3, true);
+    const ids = items.map(i=>i.id && i.id.videoId).filter(Boolean);
     const vids = ids.length ? await youtubeDataService.getVideoDetails(ids, true) : [];
-    return 'Sync pipeline OK. Channel: '+(ch.snippet?.title||'Unknown')+' | Uploads tested: '+items.length+' | Videos tested: '+vids.length;
+    return 'Sync pipeline OK. Channel: '+(ch.snippet?.title||'Unknown')+' | Videos found: '+items.length+' | Video details: '+vids.length;
   });
   document.getElementById('testGemini').onclick = ()=>runDiag('Gemini', async ()=>{
     const text = await geminiService.generate('Reply with the single word: OK', {maxTokens:10});
