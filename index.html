@@ -611,6 +611,7 @@ const errorManager = (() => {
     if(/API key not valid|keyInvalid|API_KEY_INVALID/i.test(s)) return 'YouTube API key is invalid. Create/copy the correct key from this same Google Cloud project.';
     if(/refererNotAllowed|ipRefererBlocked|API_KEY_HTTP_REFERRER_BLOCKED/i.test(s)) return 'API key HTTP-referrer restriction blocked this website. Add your exact GitHub Pages origin.';
     if(/accessNotConfigured|SERVICE_DISABLED/i.test(s)) return 'YouTube Data API v3 is not enabled for the Google Cloud project used by this API key.';
+    if(/Gemini API 404|Gemini API 403|Gemini API 400/.test(s)) return s;
     if(/404/.test(s)) return s;
     if(/Sync video request failed/i.test(s)) return s;
     if(/network|failed to fetch/i.test(s)) return 'Network error. Check your connection, browser extensions, or CORS/network blocking.';
@@ -1116,25 +1117,103 @@ const analyticsEngine = (() => {
    geminiService — Gemini API calls (interpretation / generation only)
    ========================================================================== */
 const geminiService = (() => {
+  let cachedModels = null;
+  let cachedAt = 0;
+  const MODEL_TTL = 10 * 60 * 1000;
+  const PREFERRED_MODELS = [
+    'gemini-2.5-flash',
+    'gemini-2.5-flash-lite',
+    'gemini-2.0-flash',
+    'gemini-2.0-flash-lite'
+  ];
+
+  function apiError(status, body, endpoint){
+    const err = body && body.error ? body.error : {};
+    const details = Array.isArray(err.details) ? err.details : [];
+    const reason = (details[0] && (details[0].reason || details[0].type)) || err.status || '';
+    const msg = err.message || `HTTP ${status}`;
+    const e = new Error(`Gemini API ${status} ${msg}${reason ? ` [${reason}]` : ''}`);
+    e.provider = 'Gemini';
+    e.status = status;
+    e.endpoint = endpoint;
+    e.raw = body;
+    return e;
+  }
+
+  async function listModels(force=false){
+    const cfg = configManager.get();
+    if(!cfg.GEMINI_API_KEY) throw new Error('Missing Gemini API key. Add it in Settings.');
+    if(!force && cachedModels && Date.now()-cachedAt < MODEL_TTL) return cachedModels;
+
+    const endpoint = 'https://generativelanguage.googleapis.com/v1beta/models';
+    const res = await fetch(endpoint, {headers:{'x-goog-api-key':cfg.GEMINI_API_KEY}});
+    const body = await res.json().catch(()=>({}));
+    if(!res.ok) throw apiError(res.status, body, endpoint);
+
+    const models = Array.isArray(body.models) ? body.models
+      .filter(m => m && m.name && Array.isArray(m.supportedGenerationMethods) && m.supportedGenerationMethods.includes('generateContent'))
+      .map(m => ({name:String(m.name).replace(/^models\//,''), displayName:m.displayName||''})) : [];
+
+    if(!models.length){
+      const e = new Error('Gemini API responded successfully, but this API key has no model available for generateContent. Create/check a Gemini API key in Google AI Studio.');
+      e.provider='Gemini'; e.status=200; e.endpoint=endpoint; throw e;
+    }
+    cachedModels = models; cachedAt = Date.now();
+    return models;
+  }
+
+  function chooseModel(models, requested){
+    const names = new Set(models.map(m=>m.name));
+    if(requested && names.has(requested)) return requested;
+    for(const name of PREFERRED_MODELS) if(names.has(name)) return name;
+    return models[0].name;
+  }
+
+  async function requestModel(model, prompt, opts, cfg){
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+    const body = {
+      contents: [{role:'user', parts:[{text:prompt}]}],
+      generationConfig: {temperature: opts.temperature ?? 0.6, maxOutputTokens: opts.maxTokens ?? 2048}
+    };
+    if(opts.system) body.systemInstruction = {parts:[{text:opts.system}]};
+
+    const res = await fetch(endpoint, {
+      method:'POST',
+      headers:{'Content-Type':'application/json','x-goog-api-key':cfg.GEMINI_API_KEY},
+      body:JSON.stringify(body)
+    });
+    const data = await res.json().catch(()=>({}));
+    if(!res.ok) throw apiError(res.status, data, endpoint);
+    const text = data.candidates && data.candidates[0] && data.candidates[0].content &&
+                 Array.isArray(data.candidates[0].content.parts) ?
+                 data.candidates[0].content.parts.map(p=>p.text||'').join('') : '';
+    if(!text) throw new Error(`Gemini model ${model} returned an empty response.`);
+    return text;
+  }
+
   async function generate(prompt, opts={}){
     const cfg = configManager.get();
     if(!cfg.GEMINI_API_KEY) throw new Error('Missing Gemini API key. Add it in Settings.');
-    const model = opts.model || cfg.GEMINI_MODEL || 'gemini-2.5-flash';
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(cfg.GEMINI_API_KEY)}`;
-    const body = {
-      contents: [{ role:'user', parts:[{ text: prompt }] }],
-      generationConfig: { temperature: opts.temperature ?? 0.6, maxOutputTokens: opts.maxTokens ?? 2048 }
-    };
-    if(opts.system) body.systemInstruction = { parts:[{ text: opts.system }] };
-    const res = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
-    if(!res.ok){
-      const b = await res.json().catch(()=>({}));
-      throw new Error(res.status+' '+(b.error && b.error.message || res.statusText));
+    const models = await listModels(false);
+    const requested = opts.model || cfg.GEMINI_MODEL || '';
+    let model = chooseModel(models, requested);
+    try{
+      const text = await requestModel(model, prompt, opts, cfg);
+      if(cfg.GEMINI_MODEL !== model) configManager.save({GEMINI_MODEL:model});
+      return text;
+    }catch(e){
+      // 404 often means a model is not available to this key/project. Refresh the list and retry with an actually available model.
+      if(e && e.status === 404){
+        const fresh = await listModels(true);
+        const fallback = chooseModel(fresh, '');
+        if(fallback !== model){
+          const text = await requestModel(fallback, prompt, opts, cfg);
+          if(cfg.GEMINI_MODEL !== fallback) configManager.save({GEMINI_MODEL:fallback});
+          return text;
+        }
+      }
+      throw e;
     }
-    const data = await res.json();
-    const text = data.candidates && data.candidates[0] && data.candidates[0].content &&
-                 data.candidates[0].content.parts && data.candidates[0].content.parts.map(p=>p.text||'').join('') || '';
-    return text;
   }
 
   function extractJson(text){
@@ -1152,7 +1231,7 @@ const geminiService = (() => {
     return json;
   }
 
-  return { generate, generateJson, extractJson };
+  return {generate, generateJson, extractJson, listModels};
 })();
 
 /* ==========================================================================
