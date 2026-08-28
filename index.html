@@ -478,7 +478,7 @@ canvas{width:100%; display:block;}
       <button class="btn primary" id="btnConnect">Connect Google Account</button>
       <button class="btn danger" id="btnDisconnect">Disconnect</button>
     </div>
-    <div class="help">Requested scope: yt-analytics.readonly (read-only YouTube Analytics). No upload/management permissions are ever requested.</div>
+    <div class="help">Requested scopes: youtube.readonly + yt-analytics.readonly. Both are read-only; no upload/management permissions are requested.</div>
   </div>
 
   <div class="card">
@@ -511,9 +511,11 @@ canvas{width:100%; display:block;}
       <button class="btn small" id="testStorage">Test Local Storage</button>
     </div>
     <div id="diagResults" style="margin-top:10px;"></div>
+    <div class="help" style="margin-top:8px;">API key is used only for public YouTube Data API requests. OAuth is used for your own channel and YouTube Analytics.</div>
     <div class="help" style="margin-top:8px;">
       OAuth origin requirement: this app must be served from an HTTP(S) origin that is registered as an
-      "Authorized JavaScript origin" in your Google Cloud OAuth Client (e.g. http://localhost:PORT or your HTTPS domain).
+      "Authorized JavaScript origin" in your Google Cloud OAuth Client. Requested OAuth scopes are
+      <span class="mono">youtube.readonly</span> and <span class="mono">yt-analytics.readonly</span>.
       Opening this file directly as <span class="mono">file://</span> will NOT satisfy Google's OAuth requirements.
       Current origin: <span class="mono" id="curOrigin"></span>
     </div>
@@ -557,9 +559,10 @@ const DEFAULT_CONFIG = {
   DEFAULT_PERIOD: 28,
   CACHE_HOURS: 12
 };
-const SCOPES =
-  "https://www.googleapis.com/auth/youtube.readonly " +
-  "https://www.googleapis.com/auth/yt-analytics.readonly";
+const SCOPES = [
+  "https://www.googleapis.com/auth/youtube.readonly",
+  "https://www.googleapis.com/auth/yt-analytics.readonly"
+].join(" ");
 const APP_NS = "ytGrowthAI_";
 
 /* ==========================================================================
@@ -580,8 +583,9 @@ const configManager = (() => {
   }
   function get(){ return cfg; }
   function mask(v){ if(!v) return ''; if(v.length<=8) return '••••••••'; return v.slice(0,4)+'••••••••'+v.slice(-4); }
-  function hasCreds(){ return !!(cfg.YOUTUBE_API_KEY && cfg.GOOGLE_CLIENT_ID && cfg.GEMINI_API_KEY); }
-  return { load, save, get, mask, hasCreds };
+  function hasCreds(){ return !!(cfg.YOUTUBE_API_KEY && cfg.GOOGLE_CLIENT_ID); }
+  function hasGemini(){ return !!cfg.GEMINI_API_KEY; }
+  return { load, save, get, mask, hasCreds, hasGemini };
 })();
 
 /* ==========================================================================
@@ -598,17 +602,23 @@ const errorManager = (() => {
   function classify(err){
     const s = (err && (err.message||err.toString())) || 'Unknown error';
     if(!navigator.onLine) return 'No internet connection. Showing cached data if available.';
-    if(/401|invalid[_ ]?token|unauthorized/i.test(s)) return 'Your Google session expired. Please reconnect your account.';
-    if(/403.*quota|quotaExceeded/i.test(s)) return 'API quota exceeded. Try again later or reduce sync frequency.';
-    if(/403/.test(s)) return 'Permission denied. Check OAuth scopes or API key restrictions.';
-    if(/404/.test(s)) return 'Channel or resource not found.';
-    if(/network|failed to fetch/i.test(s)) return 'Network error. Check your connection and try again.';
+    if(/OAuth authorization is missing required scope/i.test(s)) return s;
+    if(/access_denied|unauthorized_client|invalid_client/i.test(s)) return s;
+    if(/401|invalid[_ ]?token|unauthorized/i.test(s)) return 'Google OAuth token is invalid or expired. Disconnect/reconnect the Google account.';
+    if(/403.*quota|quotaExceeded|dailyLimitExceeded/i.test(s)) return 'YouTube API quota exceeded. Check Google Cloud quota or wait for reset.';
+    if(/forbidden|insufficientPermissions|PERMISSION_DENIED/i.test(s)) return 'Google denied this request. Check OAuth scopes, test-user status, and API restrictions.';
+    if(/API key not valid|keyInvalid|API_KEY_INVALID/i.test(s)) return 'YouTube API key is invalid. Create/copy the correct key from this same Google Cloud project.';
+    if(/refererNotAllowed|ipRefererBlocked|API_KEY_HTTP_REFERRER_BLOCKED/i.test(s)) return 'API key HTTP-referrer restriction blocked this website. Add your exact GitHub Pages origin.';
+    if(/accessNotConfigured|SERVICE_DISABLED/i.test(s)) return 'YouTube Data API v3 is not enabled for the Google Cloud project used by this API key.';
+    if(/404/.test(s)) return 'Google returned 404. The requested YouTube resource was not found. See Diagnostics for the exact endpoint/error.';
+    if(/network|failed to fetch/i.test(s)) return 'Network error. Check your connection, browser extensions, or CORS/network blocking.';
     if(/JSON/i.test(s)) return 'Received an unexpected response format.';
     return s;
   }
   function handle(err, context){
-    console.error('[Error]', context||'', (err&&err.message)||err); // never logs credentials
-    toast(classify(err), 'error', 5000);
+    const raw = (err&&err.message)||String(err||'Unknown error');
+    console.error('[Error]', context||'', raw); // never logs credentials
+    toast(classify(err), 'error', 6500);
   }
   return { toast, classify, handle };
 })();
@@ -695,6 +705,7 @@ const oauthService = (() => {
     tokenClient = google.accounts.oauth2.initTokenClient({
       client_id: cfg.GOOGLE_CLIENT_ID,
       scope: SCOPES,
+      include_granted_scopes: true,
       callback: () => {} // overridden per-request via requestToken()
     });
     return true;
@@ -705,19 +716,28 @@ const oauthService = (() => {
       if(!ready()){ reject(new Error('Google Identity Services failed to load (network/script blocked).')); return; }
       const cfg = configManager.get();
       if(!cfg.GOOGLE_CLIENT_ID){ reject(new Error('Missing Google OAuth Client ID. Add it in Settings.')); return; }
-      if(!tokenClient) init();
+      init();
+      if(!tokenClient){ reject(new Error('Google OAuth could not be initialized. Check the Client ID and authorized JavaScript origin.')); return; }
       tokenClient.callback = (resp) => {
         if(resp.error){
-          reject(new Error('OAuth error: '+resp.error));
+          const detail = resp.error_description ? (' — '+resp.error_description) : '';
+          reject(new Error('OAuth error: '+resp.error+detail));
+          return;
+        }
+        if(!resp.access_token){ reject(new Error('Google OAuth returned no access token.')); return; }
+        const granted = String(resp.scope||'').split(/\s+/).filter(Boolean);
+        const required = SCOPES.split(/\s+/).filter(Boolean);
+        if(granted.length && required.some(scope => !granted.includes(scope))){
+          const missing = required.filter(scope => !granted.includes(scope));
+          reject(new Error('OAuth authorization is missing required scope(s): '+missing.join(', ')+'. Revoke this app in your Google Account and connect again.'));
           return;
         }
         accessToken = resp.access_token;
         expiresAt = Date.now() + (Number(resp.expires_in||3599) * 1000);
         resolve(accessToken);
       };
-      try{
-        tokenClient.requestAccessToken({ prompt: interactive ? 'consent' : '' });
-      }catch(e){ reject(e); }
+      try{ tokenClient.requestAccessToken({ prompt: interactive ? 'consent select_account' : '' }); }
+      catch(e){ reject(e); }
     });
   }
 
@@ -1684,7 +1704,7 @@ function renderOnboarding(){
     document.getElementById('obSkip').onclick = finishOnboarding;
   } else if(step==='connect'){
     el.innerHTML = `<div class="oblogo">🔐</div><h2 style="text-align:center;">Connect Your Google Account</h2>
-    <p style="text-align:center;">We'll request read-only YouTube Analytics access (yt-analytics.readonly). No upload or management permissions.</p>
+    <p style="text-align:center;">We'll request read-only YouTube channel data + YouTube Analytics access. No upload, delete, or channel-management permissions.</p>
     <button class="btn primary" id="obConnect">Connect Google Account</button>
     <button class="btn ghost" id="obBack" style="margin-top:8px;">Back</button>
     <button class="btn ghost" id="obSkip2" style="margin-top:8px;">Skip For Now</button>`;
@@ -1793,16 +1813,33 @@ function wireSettings(){
   document.getElementById('importFile').onchange = importJson;
 
   document.getElementById('testYtData').onclick = ()=>runDiag('YouTube Data API', async ()=>{
-    if(!configManager.get().YOUTUBE_API_KEY) throw new Error('No API key set.');
-    await youtubeDataService.getChannelById('@YouTube');
-    return 'YouTube Data API connection successful.';
+    const key = configManager.get().YOUTUBE_API_KEY;
+    if(!key) throw new Error('No YouTube Data API key set.');
+    const url = new URL('https://www.googleapis.com/youtube/v3/channels');
+    url.searchParams.set('part','id,snippet');
+    url.searchParams.set('forHandle','@YouTube');
+    url.searchParams.set('key',key);
+    const res = await fetch(url.toString());
+    const body = await res.json().catch(()=>({}));
+    if(!res.ok){
+      const reason = body.error && body.error.errors && body.error.errors[0] && body.error.errors[0].reason;
+      throw new Error(res.status+' '+(body.error&&body.error.message||res.statusText)+(reason?' ('+reason+')':''));
+    }
+    return 'YouTube Data API key works. Public API test returned '+((body.items||[]).length)+' result(s).';
   });
   document.getElementById('testYtAnalytics').onclick = ()=>runDiag('YouTube Analytics', async ()=>{
-    if(!oauthService.isConnected()) throw new Error('Google OAuth authorization required.');
+    if(!oauthService.isConnected()) await oauthService.requestToken(true);
     const end=new Date(), start=new Date(); start.setDate(end.getDate()-7);
     const iso=d=>d.toISOString().slice(0,10);
     const r = await youtubeAnalyticsService.fetchReport({startDate:iso(start),endDate:iso(end),metrics:'views'});
-    return 'YouTube Analytics reachable. Rows returned: '+((r.rows||[]).length);
+    return 'YouTube Analytics works. Rows returned: '+((r.rows||[]).length)+'. OAuth token is active.';
+  });
+  document.getElementById('testYtAnalytics').insertAdjacentHTML('afterend', '<button class="btn small" id="testMyChannel">Test My Channel OAuth</button>');
+  document.getElementById('testMyChannel').onclick = ()=>runDiag('My Channel OAuth', async ()=>{
+    await oauthService.requestToken(true);
+    const ch = await youtubeDataService.getMyChannel();
+    const title = ch && ch.snippet && ch.snippet.title ? ch.snippet.title : 'Unknown channel';
+    return 'OAuth + YouTube channel access works. Channel: '+title;
   });
   document.getElementById('testGemini').onclick = ()=>runDiag('Gemini', async ()=>{
     const text = await geminiService.generate('Reply with the single word: OK', {maxTokens:10});
