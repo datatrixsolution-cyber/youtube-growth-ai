@@ -808,12 +808,34 @@ const youtubeDataService = (() => {
   }
 
   async function getUploads(playlistId, maxTotal=200, useAuth=true){
+    // Prefer the authenticated uploads playlist. If Google returns a 404 for
+    // the playlist resource, fall back to search.list using the channel ID.
+    let items = [];
+    let pageToken = '';
+    try{
+      while(items.length < maxTotal){
+        const data = await apiFetch('/playlistItems', {
+          part:'snippet,contentDetails', playlistId, maxResults:50, pageToken: pageToken||undefined
+        }, useAuth);
+        items = items.concat(data.items||[]);
+        pageToken = data.nextPageToken;
+        if(!pageToken) break;
+      }
+      return items.slice(0, maxTotal);
+    }catch(e){
+      console.warn('[YouTube] uploads playlist failed:', e.message);
+      throw e;
+    }
+  }
+
+  async function searchChannelVideos(channelId, maxTotal=200){
     let items = [];
     let pageToken = '';
     while(items.length < maxTotal){
-      const data = await apiFetch('/playlistItems', {
-        part:'snippet,contentDetails', playlistId, maxResults:50, pageToken: pageToken||undefined
-      }, useAuth);
+      const data = await apiFetch('/search', {
+        part:'snippet', channelId, type:'video', order:'date', maxResults:50,
+        pageToken: pageToken||undefined
+      }, false);
       items = items.concat(data.items||[]);
       pageToken = data.nextPageToken;
       if(!pageToken) break;
@@ -832,7 +854,7 @@ const youtubeDataService = (() => {
     return out;
   }
 
-  return { getMyChannel, getChannelById, getUploads, getVideoDetails };
+  return { getMyChannel, getChannelById, getUploads, searchChannelVideos, getVideoDetails };
 })();
 
 /* ==========================================================================
@@ -1623,9 +1645,19 @@ async function fullSync({interactive=true}={}){
     const uploadsPlaylist = channel.contentDetails && channel.contentDetails.relatedPlaylists && channel.contentDetails.relatedPlaylists.uploads;
     let rawVideos = [];
     if(uploadsPlaylist){
-      const items = await youtubeDataService.getUploads(uploadsPlaylist, 200, true);
-      const ids = items.map(i=>i.contentDetails.videoId).filter(Boolean);
-      rawVideos = await youtubeDataService.getVideoDetails(ids, true);
+      try{
+        const items = await youtubeDataService.getUploads(uploadsPlaylist, 200, true);
+        const ids = items.map(i=>i.contentDetails && i.contentDetails.videoId).filter(Boolean);
+        rawVideos = await youtubeDataService.getVideoDetails(ids, true);
+      }catch(uploadErr){
+        // Some channels/accounts can expose the channel but reject the uploads
+        // playlist resource. Fall back to public search by the authenticated
+        // channel ID so Sync can still complete.
+        console.warn('[Sync] uploads playlist failed; using search fallback', uploadErr);
+        const items = await youtubeDataService.searchChannelVideos(channel.id, 200);
+        const ids = items.map(i=>i.id && i.id.videoId).filter(Boolean);
+        rawVideos = await youtubeDataService.getVideoDetails(ids, false);
+      }
     }
     state.rawVideos = rawVideos;
     state.videos = rawVideos.map(analyticsEngine.normalizeVideo);
