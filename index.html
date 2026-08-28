@@ -465,7 +465,7 @@ canvas{width:100%; display:block;}
     <div class="field"><label>Google OAuth Client ID</label><input type="password" id="cfgClientId"></div>
     <div class="field"><label>Gemini API Key</label><input type="password" id="cfgGeminiKey"></div>
     <div class="field"><label>Gemini Model</label>
-      <input type="text" id="cfgGeminiModel" placeholder="e.g. gemini-2.5-flash">
+      <input type="text" id="cfgGeminiModel" placeholder="e.g. gemini-3.6-flash">
     </div>
     <div class="help">Keys are stored only on this device (localStorage) and are never sent anywhere except the official Google/Gemini endpoints. They are masked once saved.</div>
     <button class="btn primary" id="btnSaveSettings">Save Settings</button>
@@ -555,7 +555,7 @@ const DEFAULT_CONFIG = {
   YOUTUBE_API_KEY: "",              // YOUR_YOUTUBE_DATA_API_KEY
   GOOGLE_CLIENT_ID: "",             // YOUR_GOOGLE_OAUTH_CLIENT_ID
   GEMINI_API_KEY: "",               // YOUR_GEMINI_API_KEY
-  GEMINI_MODEL: "gemini-2.5-flash", // change in Settings if needed
+  GEMINI_MODEL: "gemini-3.6-flash", // change in Settings if needed
   THEME: "dark",
   DEFAULT_PERIOD: 28,
   CACHE_HOURS: 12
@@ -1121,10 +1121,11 @@ const geminiService = (() => {
   let cachedAt = 0;
   const MODEL_TTL = 10 * 60 * 1000;
   const PREFERRED_MODELS = [
-    'gemini-2.5-flash',
-    'gemini-2.5-flash-lite',
-    'gemini-2.0-flash',
-    'gemini-2.0-flash-lite'
+    'gemini-3.7-flash',
+    'gemini-3.6-flash',
+    'gemini-3.5-flash',
+    'gemini-3.5-flash-lite',
+    'gemini-3.1-flash-lite'
   ];
 
   function apiError(status, body, endpoint){
@@ -1906,7 +1907,7 @@ function wireSettings(){
       YOUTUBE_API_KEY: document.getElementById('cfgYtKey').value.trim(),
       GOOGLE_CLIENT_ID: document.getElementById('cfgClientId').value.trim(),
       GEMINI_API_KEY: document.getElementById('cfgGeminiKey').value.trim(),
-      GEMINI_MODEL: document.getElementById('cfgGeminiModel').value.trim() || 'gemini-2.5-flash',
+      GEMINI_MODEL: document.getElementById('cfgGeminiModel').value.trim() || 'gemini-3.6-flash',
       DEFAULT_PERIOD: Number(document.getElementById('cfgDefaultPeriod').value),
       CACHE_HOURS: Number(document.getElementById('cfgCacheHrs').value),
       THEME: document.getElementById('cfgTheme').value
